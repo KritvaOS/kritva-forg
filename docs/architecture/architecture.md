@@ -1960,7 +1960,47 @@ It writes `analysis/reports/dataset_v2_report.json`, which holds:
 - soft findings;
 - the dataset identity `ds2:`.
 
-Files are replaced only after the whole dataset was built.
+**Hardening (KF-DQ-013.1).**
+- *Typed record contract.* `validator.record_type_problems` is the single definition of a record's
+  typed shape. It is shared by the gate, the stale gate and the data-manifest summary:
+  - exact key sets at every level;
+  - strings / integers, with booleans never accepted as integers;
+  - `target` either `json` {`projection`, `value` object} or a text kind (`rtl` / `prompt_v2`) {`text`};
+  - `sources` a list of {`layer`, `path`, `sha256`} strings;
+  - `versions` a flat object of strings / integers.
+  The gate checks the shape before dereferencing anything. A malformed record is reported as
+  `<file>:<line>: <field path>: …` and is then skipped for every later check.
+- *Never-raise contract.* `check()` returns a report for every input:
+  - invalid JSON, non-object values and non-UTF-8 files FAIL with a diagnostic;
+  - the dataset identity is `null` unless every line is well typed;
+  - an unexpected internal error becomes the separate generic problem
+    `internal validation error: <type>`, with details on stderr only.
+  The stale gate marks a malformed split file `STALE` ("malformed multi-task record"). The manifest
+  summary gets a `null` identity, so the manifest check fails and the manifest build refuses.
+- *Recoverable publication.* `build.write()` publishes the dataset in five steps:
+  1. it stages the complete generation in `datasets/multitask/.v2.tmp-<pid>/`;
+  2. it re-reads and verifies the staged generation (bytes, typed shape, registry);
+  3. it renames `v2` to `.v2.old-<pid>`;
+  4. it renames the staging directory to `v2`;
+  5. it removes `.v2.old-<pid>`.
+
+  Files are never replaced one by one. The only window in which `v2` is absent is between steps 3
+  and 4, when the previous generation is held in `.v2.old-<pid>`.
+
+  Every `write()` begins with recovery:
+  - it removes leftover `.v2.tmp-*` directories;
+  - if `v2` is absent, it restores a single `.v2.old-*`;
+  - if `v2` exists, it removes leftover `.v2.old-*` directories. An existing `v2` is always a
+    verified generation.
+  - It stops with a `BuildError` when `v2` is absent and several old generations exist, or when
+    the restore fails. In both cases it keeps every candidate.
+
+  A failure in step 5 leaves the new `v2` published, with a warning. Until removed, leftovers are
+  reported by the gate (unmanaged) and by the stale gate (`UNMANAGED`). The guarantee is
+  recoverable publication, not crash-atomic transactionality.
+- *CI coverage.* CI runs the public tests and the header check only. The private-corpus
+  `data-quality` and the reference regression run on the device, and the task apply scripts
+  record them as evidence.
 
 **Integration.**
 - The Prompt v2 consumption gate allows Prompt v2 only in `datasets/multitask/v2` `rtl_generation`

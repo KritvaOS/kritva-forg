@@ -59,47 +59,124 @@ def _quantiles(values: list) -> dict:
     return {f"p{q}": v[min(len(v) - 1, int(round(q / 100 * (len(v) - 1))))] for q in (50, 90, 99, 100)}
 
 
-def dataset_identity(lines_by_split: dict) -> str:
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _object(value, path: str, fields: dict, problems: list) -> bool:
+    """``value`` must be an object with exactly ``fields`` (name -> predicate, description)."""
+    if not isinstance(value, dict):
+        problems.append(f"{path}: expected an object, got {type(value).__name__}")
+        return False
+    if sorted(value) != sorted(fields):
+        problems.append(f"{path} fields {sorted(value)}, expected {sorted(fields)}")
+        return False
+    ok = True
+    for name, (pred, what) in fields.items():
+        if not pred(value[name]):
+            problems.append(f"{path}.{name}: expected {what}, got {type(value[name]).__name__}")
+            ok = False
+    return ok
+
+
+_STR = (lambda v: isinstance(v, str), "a string")
+_INT = (_is_int, "an integer")
+
+
+def record_type_problems(rec) -> list:
+    """Typed shape of one multi-task record (KF-DQ-013.1 AC-010 / AC-011).
+
+    Never raises for any JSON value; returns the list of problems, each naming the field path.
+    """
+    problems = []
+    if not isinstance(rec, dict):
+        return [f"record: expected an object, got {type(rec).__name__}"]
+    if sorted(rec) != sorted(G.RECORD_KEYS):
+        return [f"record fields {sorted(rec)}, expected {sorted(G.RECORD_KEYS)}"]
+    for key in ("record_id", "split"):
+        if not isinstance(rec[key], str):
+            problems.append(f"record.{key}: expected a string, got {type(rec[key]).__name__}")
+    _object(rec["schema"], "record.schema", {"name": _STR, "version": _INT}, problems)
+    _object(rec["task"], "record.task", {"id": _STR, "version": _INT}, problems)
+    _object(rec["module"], "record.module", {"ip": _STR, "module_id": _STR, "name": _STR}, problems)
+    _object(rec["input"], "record.input",
+            {"kind": (lambda v: isinstance(v, str) and v in G.INPUT_KINDS, f"one of {list(G.INPUT_KINDS)}"),
+             "text": _STR}, problems)
+    tgt = rec["target"]
+    if not isinstance(tgt, dict):
+        problems.append(f"record.target: expected an object, got {type(tgt).__name__}")
+    elif tgt.get("kind") == "json":
+        _object(tgt, "record.target", {"kind": _STR, "projection": _STR,
+                                       "value": (lambda v: isinstance(v, dict), "an object")}, problems)
+    elif isinstance(tgt.get("kind"), str) and tgt["kind"] in G.INPUT_KINDS:
+        _object(tgt, "record.target", {"kind": _STR, "text": _STR}, problems)
+    else:
+        problems.append(f"record.target.kind: expected one of {['json', *G.INPUT_KINDS]}, got {tgt.get('kind')!r}")
+    srcs = rec["sources"]
+    if not isinstance(srcs, list):
+        problems.append(f"record.sources: expected a list, got {type(srcs).__name__}")
+    else:
+        for i, s in enumerate(srcs):
+            _object(s, f"record.sources[{i}]", {"layer": _STR, "path": _STR, "sha256": _STR}, problems)
+    ver = rec["versions"]
+    if not isinstance(ver, dict):
+        problems.append(f"record.versions: expected an object, got {type(ver).__name__}")
+    else:
+        for k in sorted(ver):
+            if not (isinstance(ver[k], str) or _is_int(ver[k])):
+                problems.append(f"record.versions.{k}: expected a string or an integer, got {type(ver[k]).__name__}")
+    return problems
+
+
+def dataset_identity(lines_by_split: dict):
+    """``ds2:`` identity; ``None`` unless every line is a well-typed record (AC-015)."""
     rows = []
     for split, lines in lines_by_split.items():
         for line in lines:
-            rid = json.loads(line).get("record_id")
-            rows.append(f"{rid}\t{split}\t{hashlib.sha256(line.encode('utf-8')).hexdigest()}")
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                return None
+            if record_type_problems(rec):
+                return None
+            rows.append(f"{rec['record_id']}\t{split}\t{hashlib.sha256(line.encode('utf-8')).hexdigest()}")
     return "ds2:" + hashlib.sha256("\n".join(sorted(rows)).encode("utf-8")).hexdigest()[:16]
 
 
 def _record_problems(rec, split, problems):
-    """Structural checks of one record (AC-013, AC-014, AC-018)."""
-    if sorted(rec) != sorted(G.RECORD_KEYS):
-        problems.append(f"{split}: record {rec.get('record_id')} has keys {sorted(rec)}")
-        return
-    for key in ("schema", "task", "module", "input"):
-        if not isinstance(rec[key], dict) or sorted(rec[key]) != sorted(G.NESTED[key]):
-            problems.append(f"{split}: record {rec['record_id']} {key} fields {sorted(rec[key]) if isinstance(rec[key], dict) else rec[key]!r}")
+    """Value checks of one well-typed record (AC-013, AC-014, AC-018); the typed shape is checked first."""
     tgt = rec["target"]
-    want = G.TARGET_JSON if isinstance(tgt, dict) and tgt.get("kind") == "json" else G.TARGET_TEXT
-    if not isinstance(tgt, dict) or sorted(tgt) != sorted(want):
-        problems.append(f"{split}: record {rec['record_id']} target fields invalid")
-    if not isinstance(rec["sources"], list) or any(not isinstance(s, dict) or sorted(s) != sorted(G.NESTED["source"])
-                                                   for s in rec["sources"]):
-        problems.append(f"{split}: record {rec['record_id']} sources invalid")
-    if not isinstance(rec["versions"], dict) or any(isinstance(v, (dict, list)) for v in rec["versions"].values()):
-        problems.append(f"{split}: record {rec['record_id']} versions not a flat object")
     if rec["schema"] != G.DATASET_SCHEMA:
         problems.append(f"{split}: record {rec['record_id']} schema {rec['schema']!r}")
     if rec["split"] != split:
         problems.append(f"{split}: record {rec['record_id']} declares split {rec['split']!r}")
+    _leak_problems(rec, split, problems)
+
+
+def _leak_problems(rec: dict, split, problems):
+    """Text-only leak scan of the metadata and JSON target (AC-018); safe for any JSON object."""
     meta = {k: v for k, v in rec.items() if k not in ("input", "target")}
+    tgt = rec.get("target")
     meta["target"] = {k: v for k, v in tgt.items() if k != "text"} if isinstance(tgt, dict) else tgt
     text = json.dumps(meta, sort_keys=True)
+    rid = rec.get("record_id")
     if _ID_LEAK.search(text) or '"loc"' in text:
-        problems.append(f"{split}: record {rec['record_id']} leaks an internal id or location")
+        problems.append(f"{split}: record {rid} leaks an internal id or location")
     from scripts.core.paths import find_absolute_paths
     if find_absolute_paths(text):
-        problems.append(f"{split}: record {rec['record_id']} contains an absolute path")
+        problems.append(f"{split}: record {rid} contains an absolute path")
 
 
 def check(data_root, authorize: bool = True) -> dict:
+    """Never raises (KF-DQ-013.1 AC-016): every input yields a report; unexpected errors FAIL."""
+    try:
+        return _check(data_root, authorize)
+    except Exception as exc:  # last-resort guard; malformed-input tests never rely on it
+        print(f"[internal] multi-task validator: {exc!r}", file=sys.stderr)
+        return _report([f"internal validation error: {type(exc).__name__}"], {}, {}, None, None, None)
+
+
+def _check(data_root, authorize: bool = True) -> dict:
     from scripts.prompt_v2.render import canonical_modules
 
     root = Path(os.path.abspath(data_root))
@@ -122,7 +199,11 @@ def check(data_root, authorize: bool = True) -> dict:
     by_module = defaultdict(set)
     task_modules = defaultdict(set)
     for split in G.SPLITS:
-        raw = (base / f"{split}.jsonl").read_text(encoding="utf-8")
+        try:
+            raw = (base / f"{split}.jsonl").read_bytes().decode("utf-8")
+        except UnicodeDecodeError as exc:
+            problems.append(f"{split}.jsonl: not valid UTF-8 (byte {exc.start})")
+            continue
         lines = raw.splitlines(keepends=True)
         lines_by_split[split] = lines
         recs = []
@@ -132,12 +213,16 @@ def check(data_root, authorize: bool = True) -> dict:
             except ValueError as exc:
                 problems.append(f"{split}.jsonl:{n}: invalid JSON ({exc})")
                 continue
+            typed = record_type_problems(rec)
+            if typed:
+                problems.extend(f"{split}.jsonl:{n}: {p}" for p in typed)
+                if isinstance(rec, dict):
+                    _leak_problems(rec, split, problems)
+                continue
             if G.dumps_record(rec) != line:
                 problems.append(f"{split}.jsonl:{n}: not canonical JSON")
             _record_problems(rec, split, problems)
-            if sorted(rec) != sorted(G.RECORD_KEYS):
-                continue
-            task = G.BY_ID.get((rec.get("task") or {}).get("id"))
+            task = G.BY_ID.get(rec["task"]["id"])
             if task is None:
                 problems.append(f"{split}.jsonl:{n}: unknown task {rec.get('task')!r}")
                 continue
@@ -153,12 +238,12 @@ def check(data_root, authorize: bool = True) -> dict:
             by_module[(m.get("ip"), m.get("name"))].add(split)
             task_modules[task["id"]].add((m.get("ip"), m.get("name")))
             tgt = rec["target"]
-            if task["projection"] and (tgt.get("kind") != "json" or tgt.get("projection") != task["projection"]):
+            if task["projection"] and (tgt["kind"] != "json" or tgt.get("projection") != task["projection"]):
                 problems.append(f"{split}.jsonl:{n}: target projection {tgt.get('projection')!r} (registry {task['projection']})")
             for s in rec["sources"]:
-                p = root / str(s.get("path"))
-                if not p.is_file() or hashlib.sha256(p.read_bytes()).hexdigest() != s.get("sha256"):
-                    problems.append(f"{split}.jsonl:{n}: stale or missing source {s.get('layer')} {s.get('path')}")
+                p = root / s["path"]
+                if not p.is_file() or hashlib.sha256(p.read_bytes()).hexdigest() != s["sha256"]:
+                    problems.append(f"{split}.jsonl:{n}: stale or missing source {s['layer']} {s['path']}")
             recs.append(rec)
         keys = [(r["task"]["id"], r["module"]["ip"], r["module"]["name"]) for r in recs]
         if keys != sorted(keys):
@@ -188,8 +273,8 @@ def check(data_root, authorize: bool = True) -> dict:
 
     # registry (AC-011)
     counts = Counter(r["task"]["id"] for s in G.SPLITS for r in records.get(s, []))
-    reg_text = (root / G.REGISTRY_PATH).read_text(encoding="utf-8")
-    if reg_text != G.dumps(G.document(dict(counts))):
+    reg_bytes = (root / G.REGISTRY_PATH).read_bytes()
+    if reg_bytes != G.dumps(G.document(dict(counts))).encode("utf-8"):
         problems.append("registry.json differs from the forge task registry (with record counts)")
 
     # entry authorization and re-derivation (AC-037, AC-042)
@@ -198,7 +283,7 @@ def check(data_root, authorize: bool = True) -> dict:
         expected = B.build(root, authorize=authorize)
         auth, stats = expected["authorization"], expected["stats"]
         files = B.serialize(expected)
-        diff = sorted(rel for rel, text in files.items() if (root / rel).read_text(encoding="utf-8") != text)
+        diff = sorted(rel for rel, text in files.items() if (root / rel).read_bytes() != text.encode("utf-8"))
         if diff:
             problems.append(f"dataset differs from a re-derivation from the persisted artifacts: {diff}")
     except B.BuildError as exc:
@@ -217,7 +302,9 @@ def _report(problems, records, counts, lines_by_split, auth, stats) -> dict:
                else len(json.dumps(r["target"]["value"], sort_keys=True, separators=(",", ":"))) for r in recs]
         sizes[t["id"]] = {"input_chars": _quantiles([len(r["input"]["text"]) for r in recs]),
                           "target_chars": _quantiles(tgt)}
-    fsm = [r for s in G.SPLITS for r in records.get(s, []) if r["task"]["id"] == "fsm_extraction"]
+    fsm = [r["target"]["value"].get("fsms") for s in G.SPLITS for r in records.get(s, [])
+           if r["task"]["id"] == "fsm_extraction" and r["target"]["kind"] == "json"]
+    fsm = [f if isinstance(f, list) else [] for f in fsm]
     empty = Counter()
     for s in G.SPLITS:
         for r in records.get(s, []):
@@ -234,11 +321,11 @@ def _report(problems, records, counts, lines_by_split, auth, stats) -> dict:
         "tasks": {t["id"]: {"version": t["version"], "status": t["status"], "projection": t["projection"],
                             "records": counts.get(t["id"], 0)} for t in G.TASKS},
         "counts": {"records": sum(per_split.values()), "splits": per_split, "by_task": by_task_split},
-        "dataset_identity": dataset_identity(lines_by_split) if lines_by_split else None,
+        "dataset_identity": dataset_identity(lines_by_split)
+        if lines_by_split and sorted(lines_by_split) == sorted(G.SPLITS) else None,
         "sizes": sizes,
-        "fsm_extraction": {"positive": sum(1 for r in fsm if r["target"]["value"]["fsms"]),
-                           "negative": sum(1 for r in fsm if not r["target"]["value"]["fsms"]),
-                           "fsms": sum(len(r["target"]["value"]["fsms"]) for r in fsm)},
+        "fsm_extraction": {"positive": sum(1 for f in fsm if f), "negative": sum(1 for f in fsm if not f),
+                           "fsms": sum(len(f) for f in fsm)},
         "empty_collections": dict(sorted(empty.items())),
         "nulls_and_unresolved": stats,
         "authorization": auth,

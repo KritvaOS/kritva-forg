@@ -57,6 +57,16 @@ It is rebuilt by `make pipeline`, or by `make multitask` on an existing data roo
 `make check-multitask`. The legacy `datasets/pipeline/` (Prompt v1 `rtl_generation`) is unchanged and
 coexists with it. See `docs/architecture/architecture.md` §11.6.
 
+The dataset is published as a whole directory: the new generation is staged and verified, then
+swapped in. If a build is interrupted, `datasets/multitask/` can hold a hidden `.v2.tmp-<pid>/` or
+`.v2.old-<pid>/` directory. `make check-multitask` reports it as unmanaged. The next
+`make multitask` or `make pipeline` recovers automatically:
+- it deletes the staging directory;
+- it restores `.v2.old-<pid>` if `v2` is missing.
+
+If `v2` is missing and several `.v2.old-*` directories exist, the build stops. In that case, rename
+the intended one to `v2` by hand.
+
 ## Open-source reference corpus (KF-DQ-012.2)
 
 For a local regression without the private repository, `reference/` pins five

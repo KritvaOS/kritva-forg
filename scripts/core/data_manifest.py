@@ -475,16 +475,22 @@ def _multitask_summary(root: Path) -> dict:
     from scripts.multitask import validator as MV
 
     lines, counts, splits = {}, Counter(), {}
+    readable = True
     for name in MG.SPLITS:
         f = root / f"{MG.OUTPUT_DIR}/{name}.jsonl"
-        lines[name] = f.read_text(encoding="utf-8").splitlines(keepends=True) if f.is_file() else []
+        try:
+            lines[name] = f.read_bytes().decode("utf-8").splitlines(keepends=True) if f.is_file() else []
+        except UnicodeDecodeError:  # KF-DQ-013.1 AC-018: never raise; the identity becomes null
+            lines[name], readable = [], False
         splits[name] = len(lines[name])
         for line in lines[name]:
             try:
-                counts[(json.loads(line).get("task") or {}).get("id")] += 1
+                rec = json.loads(line)
             except ValueError:
                 counts[None] += 1
-    present = all((root / f"{MG.OUTPUT_DIR}/{n}.jsonl").is_file() for n in MG.SPLITS)
+                continue
+            counts[None if MV.record_type_problems(rec) else rec["task"]["id"]] += 1
+    present = readable and all((root / f"{MG.OUTPUT_DIR}/{n}.jsonl").is_file() for n in MG.SPLITS)
     return {
         "path": MG.OUTPUT_DIR,
         "registry": MG.REGISTRY_PATH,

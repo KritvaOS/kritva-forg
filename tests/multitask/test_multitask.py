@@ -511,4 +511,3 @@ def test_manifest_v7_multitask_section(corpus):
     assert mt["dataset_identity"] == json.loads((corpus.root / G.REPORT_PATH).read_text())["dataset_identity"]
     assert m["versions"]["dataset_schema"] == 2 and m["versions"]["task_registry"] == 1
     assert DM.check(corpus.root)["status"] == "PASS"
-

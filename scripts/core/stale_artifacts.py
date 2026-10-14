@@ -716,20 +716,25 @@ def _multitask_state(ctx, root: Path, rel: str, kind: str, counters) -> tuple[st
     path = root / rel
     if kind == "multitask_split":
         sha_cache = {}
-        for rec in _jsonl(path) or []:
+        recs = _jsonl(path)
+        if recs is None:
+            return "STALE", "unreadable multi-task dataset file"
+        for rec in recs:
             counters["multitask_records_checked"] += 1
-            if not isinstance(rec, dict) or rec.get("schema") != MG.DATASET_SCHEMA:
+            if MV.record_type_problems(rec):  # KF-DQ-013.1 AC-017: typed shape before any dereference
+                return "STALE", "malformed multi-task record"
+            if rec["schema"] != MG.DATASET_SCHEMA:
                 counters["obsolete_schema"] += 1
                 return "STALE", "obsolete or unreadable dataset schema"
-            m = rec.get("module") or {}
-            if (m.get("ip"), m.get("name")) not in ctx.modules:
-                return "ORPHAN", f"record for non-canonical module {m.get('ip')}/{m.get('name')}"
-            for src in rec.get("sources", []):
-                sp = root / str(src.get("path"))
-                if src.get("path") not in sha_cache:
-                    sha_cache[src.get("path")] = _sha(sp) if sp.is_file() else None
-                if sha_cache[src.get("path")] != src.get("sha256"):
-                    return "STALE", f"derived from an older {src.get('layer')} revision ({src.get('path')})"
+            m = rec["module"]
+            if (m["ip"], m["name"]) not in ctx.modules:
+                return "ORPHAN", f"record for non-canonical module {m['ip']}/{m['name']}"
+            for src in rec["sources"]:
+                sp = root / src["path"]
+                if src["path"] not in sha_cache:
+                    sha_cache[src["path"]] = _sha(sp) if sp.is_file() else None
+                if sha_cache[src["path"]] != src["sha256"]:
+                    return "STALE", f"derived from an older {src['layer']} revision ({src['path']})"
         return "CURRENT", None
     data = _load_json(path)
     if kind == "multitask_registry":
@@ -748,7 +753,10 @@ def _multitask_state(ctx, root: Path, rel: str, kind: str, counters) -> tuple[st
         f = root / f"{MG.OUTPUT_DIR}/{name}.jsonl"
         if not f.is_file():
             return "STALE", "dataset files missing"
-        lines[name] = f.read_text(encoding="utf-8").splitlines(keepends=True)
+        try:
+            lines[name] = f.read_bytes().decode("utf-8").splitlines(keepends=True)
+        except UnicodeDecodeError:
+            return "STALE", "dataset files are not valid UTF-8"
     if data.get("dataset_identity") != MV.dataset_identity(lines):
         return "STALE", "report does not describe the current dataset"
     return "CURRENT", None

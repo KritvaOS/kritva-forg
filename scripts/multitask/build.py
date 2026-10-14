@@ -248,25 +248,98 @@ def serialize(result: dict) -> dict:
     return files
 
 
+def _recover(parent: Path, final: Path) -> list:
+    """Deterministic recovery of an interrupted publication (KF-DQ-013.1 AC-033); returns log lines."""
+    import shutil
+
+    log = []
+    if not parent.is_dir():
+        return log
+    try:
+        for d in sorted(parent.glob(f".{final.name}.tmp-*")):
+            shutil.rmtree(d)
+            log.append(f"removed unpublished staging directory {d.name}")
+    except OSError as exc:
+        raise BuildError(f"cannot remove an unpublished staging directory: {type(exc).__name__}") from exc
+    old = sorted(parent.glob(f".{final.name}.old-*"))
+    if not final.exists():
+        if len(old) > 1:
+            raise BuildError(f"{final.name} is missing and several previous generations exist: "
+                             f"{[d.name for d in old]}; restore one by hand")
+        if old:
+            try:
+                os.rename(old[0], final)
+            except OSError as exc:
+                raise BuildError(f"cannot restore {final.name} from {old[0].name} "
+                                 f"({type(exc).__name__}); it is kept unchanged") from exc
+            log.append(f"restored {final.name} from {old[0].name}")
+            old = []
+    # an existing final directory only ever comes from renaming a verified staging directory,
+    # so it is complete and the previous generations are no longer needed
+    for d in old:
+        shutil.rmtree(d)
+        log.append(f"removed previous generation {d.name}")
+    return log
+
+
+def _verify_staged(stage: Path, root: Path, files: dict, counts: dict) -> None:
+    """Re-read the staged generation before publishing (AC-031); fail closed."""
+    from scripts.multitask import validator as V
+
+    for rel, text in files.items():
+        staged = stage / Path(rel).relative_to(G.OUTPUT_DIR)
+        if staged.read_bytes() != text.encode("utf-8"):
+            raise BuildError(f"staged {rel} differs from the serialized dataset")
+        if rel.endswith(".jsonl"):
+            for n, line in enumerate(text.splitlines(), 1):
+                problems = V.record_type_problems(json.loads(line))
+                if problems:
+                    raise BuildError(f"staged {rel}:{n}: {problems[0]}")
+    if files[G.REGISTRY_PATH] != G.dumps(G.document(counts)):
+        raise BuildError("staged registry differs from the forge task registry")
+
+
 def write(data_root, result: dict | None = None) -> dict:
-    """Build, then replace the dataset files only after every file was written (AC-073)."""
+    """Build, stage the complete generation, verify it, then publish it with one directory switch.
+
+    KF-DQ-013.1 AC-030 .. AC-033: files are never replaced one by one. The only window in which the
+    published directory is absent is between the two renames; the previous generation is then kept
+    under ``.v2.old-<pid>`` and the next ``write()`` restores it (``_recover``).
+    """
+    import shutil
+
     root = Path(os.path.abspath(data_root))
+    final = root / G.OUTPUT_DIR
+    parent = final.parent
+    for line in _recover(parent, final):
+        print(f"[INFO] multi-task publication recovery: {line}")
     result = result if result is not None else build(root)
     files = serialize(result)
-    out = root / G.OUTPUT_DIR
-    out.mkdir(parents=True, exist_ok=True)
-    tmp = {}
+    counts = Counter(r["task"]["id"] for s in G.SPLITS for r in result["records"][s])
+    parent.mkdir(parents=True, exist_ok=True)
+    stage = parent / f".{final.name}.tmp-{os.getpid()}"
+    old = parent / f".{final.name}.old-{os.getpid()}"
     try:
+        stage.mkdir()
         for rel, text in files.items():
-            t = root / (rel + ".tmp")
-            t.write_text(text, encoding="utf-8")
-            tmp[rel] = t
-        for rel, t in tmp.items():
-            os.replace(t, root / rel)
-    finally:
-        for t in tmp.values():
-            if t.exists():
-                t.unlink()
+            (stage / Path(rel).relative_to(G.OUTPUT_DIR)).write_bytes(text.encode("utf-8"))
+        _verify_staged(stage, root, files, dict(counts))
+    except BaseException:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+    if final.exists():
+        os.rename(final, old)          # step 1
+    try:
+        os.rename(stage, final)        # step 2
+    except OSError as exc:
+        raise BuildError(f"publication interrupted ({type(exc).__name__}); the previous generation is kept "
+                         f"in {old.name} and the next build restores it") from exc
+    if old.exists():
+        try:
+            shutil.rmtree(old)         # step 3
+        except OSError as exc:
+            print(f"[WARN] published {G.OUTPUT_DIR}; could not remove the previous generation {old.name} "
+                  f"({type(exc).__name__}); the next build removes it")
     return result
 
 
